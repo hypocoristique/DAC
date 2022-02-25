@@ -1,0 +1,21 @@
+batch_size: 100
+decay: 0.99999
+env: CartPole-v1
+explo: 0.1
+featExtractor: !!python/name:core.NothingToDo ''
+freqOptim: 10
+freqSave: 1000
+freqTarget: 1001
+freqTest: 100
+freqVerbose: 100
+fromFile: null
+gamma: 0.99
+lr: 0.0003
+maxLengthTest: 500
+maxLengthTrain: 300
+mem_size: 10000
+nbEpisodes: 1000000
+nbTest: 1
+prior: false
+seed: 5
+target_network: true

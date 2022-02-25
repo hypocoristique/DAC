@@ -1,0 +1,26 @@
+decay: 0.999
+env: gridworld-v0
+execute: env.setPlan(config["map"], config["rewards"])
+explo: 0.1
+featExtractor: !!python/name:core.MapFromDumpExtractor2 ''
+freqOptim: 1000
+freqSave: 1000
+freqTest: 10
+freqVerbose: 10
+fromFile: null
+gamma: 0.99
+lr: 0.01
+map: gridworldPlans/plan1.txt
+maxLengthTest: 300
+maxLengthTrain: 100
+mode: TD(0)
+nbEpisodes: 500
+nbTest: 1
+rewards:
+  0: -0.001
+  3: 1
+  4: 1
+  5: -1
+  6: -1
+seed: 5
+tau: 0.99

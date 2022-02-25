@@ -1,0 +1,17 @@
+decay: 0.999
+env: LunarLander-v2
+explo: 0.1
+exploMode: 0
+featExtractor: !!python/name:core.NothingToDo ''
+freqOptim: 1
+freqSave: 1000
+freqTest: 10
+freqVerbose: 10
+fromFile: null
+gamma: 0.999
+learningRate: 0.1
+maxLengthTest: 500
+maxLengthTrain: 100
+nbEpisodes: 1000000
+nbTest: 1
+seed: 5

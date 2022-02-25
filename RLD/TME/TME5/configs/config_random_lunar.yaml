@@ -1,0 +1,17 @@
+env: LunarLander-v2
+seed: 5
+featExtractor: !!python/name:__main__.NothingToDo ''
+freqSave: 1000
+freqTest: 10
+nbTest: 1
+freqVerbose: 10
+freqOptim: 1000                                                                          # Optimisation de la politique tous les freqOptim evenements
+fromFile: null
+nbEpisodes: 2000
+maxLengthTrain: 600
+maxLengthTest: 200
+gamma: 0.99
+decay: 0.999
+lr: 0.02
+tau: 0.99
+mode: 'TD(0)' # among 'TD(0)', 'MC', 'TD(lambda)'  lambda parameter is the same as the gae, i.e tau.

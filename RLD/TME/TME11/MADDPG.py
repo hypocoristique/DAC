@@ -1,0 +1,529 @@
+import argparse
+import sys
+from turtle import forward
+import matplotlib
+#matplotlib.use("Qt5agg")
+matplotlib.use("TkAgg")
+import gym
+import multiagent
+import multiagent.scenarios
+import multiagent.scenarios.simple_tag as simple_tag
+import multiagent.scenarios.simple_tag as simple_spread
+import multiagent.scenarios.simple_tag as simple_adversary
+from multiagent.environment import MultiAgentEnv
+from torch.utils.tensorboard import SummaryWriter
+import multiagent.scenarios as scenarios
+from gym import wrappers, logger
+import numpy as np
+import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import os
+import torch.backends.cudnn as cudnn
+import matplotlib.pyplot as plt
+import time
+import logging
+import json
+import subprocess
+from collections import namedtuple,defaultdict
+from utils import *
+from multiagent.core import *
+from datetime import datetime
+from collections import deque
+
+from icecream import ic
+import random
+
+class Q(nn.Module):
+    def __init__(self, s_dim, a_dim, hidden_size_q):
+        super(Q, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(sum(s_dim)+sum(a_dim), hidden_size_q),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size_q, hidden_size_q//2),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size_q//2, 1)
+        )
+    
+    def forward(self, s, a):
+        a = torch.cat(a, dim=1)
+        s = torch.cat(s, dim=1)
+        return self.model(torch.cat([s, a], dim=1))
+    
+class Mu(nn.Module):
+    def __init__(self, s_i_dim, a_i_dim, hidden_size_mu):
+        super(Mu, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(s_i_dim, hidden_size_mu),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size_mu, hidden_size_mu//2),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size_mu//2, a_i_dim),
+            nn.Tanh()
+        )
+    
+    def forward(self, s):
+        return self.model(s)
+
+
+class Agent(object):
+    floatTensor = torch.FloatTensor(1)
+    longTensor = torch.LongTensor(1)
+
+    # agent_type: 0 = random, 1 = DDPG, 2 = MADDPG
+    def __init__(self, env, opt, id, action_size, obs_shapes, agent_type=2, nb_subPolicies=1, optimizer=torch.optim.Adam, lr=0.1, lrq=0.1, hidden_size_q=128, hidden_size_mu=128):
+
+        self.id = id
+        self.opt = opt
+        self.agent_type = agent_type
+        self.obs_shapes = obs_shapes
+        self.env = env
+        self.action_size = action_size
+        self.nb_subPolicies = nb_subPolicies
+        self.policies = []
+        self.targetPolicies = []
+
+        if agent_type == 0: #random
+            self.nb_subPolicies = 0
+        else:
+            #TODO votre agent ici
+            self.nb_subPolicies = 1
+            self.q = Q(obs_shapes, [action_size for i in range(env.n)], hidden_size_q)
+            self.policies.append(Mu(obs_shapes[id], action_size, hidden_size_mu))
+            self.qtarget = Q(obs_shapes, [action_size for i in range(env.n)], hidden_size_q)
+            self.targetPolicies.append(Mu(obs_shapes[id], action_size, hidden_size_mu))
+
+            self.polyakP = self.opt.polyakP
+            self.polyakQ = self.opt.polyakQ
+        self.currentPolicy = 0
+
+        self.events = [deque(maxlen=self.opt.capacity) for i in range(nb_subPolicies)]
+        self.batchsize = self.opt.batchsize
+
+        if self.opt.fromFile is not None:
+            self.load(self.opt.fromFile)
+
+        # Creation optimiseurs
+        if agent_type > 0:  # not random
+            wdq = self.opt.wdq   # weight decay for q
+            wdp = self.opt.wdp  # weight decay for pi
+            self.qtarget.load_state_dict(self.q.state_dict())
+            for i in range(nb_subPolicies):
+                self.targetPolicies[i].load_state_dict(self.policies[i].state_dict())
+
+            self.optimizerP = [optimizer([{"params": self.policies[i].parameters()}], weight_decay=wdp, lr=lr) for i in
+                                   range(nb_subPolicies)]
+            self.optimizerQ = optimizer([{"params": self.q.parameters()}], weight_decay=wdq, lr=lrq)
+
+
+    def act(self, obs):
+        if self.agent_type == 0:
+            a = self.floatTensor.new((np.random.rand(self.action_size) - 0.5) * 2).view(-1)
+            return a
+        return self.policies[self.currentPolicy](obs)
+
+    def getTargetAct(self,obs):
+        if self.agent_type == 0:
+            a=self.floatTensor.new((np.random.rand(obs.shape[0],self.action_size) - 0.5) * 2).view(-1,self.action_size)
+            return a
+        i = np.random.randint(0, self.nb_subPolicies, 1)[0]
+        return self.targetPolicies[i](obs)
+
+    def addEvent(self,event):
+        if self.agent_type == 0:
+            return
+        i=self.currentPolicy
+        self.events[i].append(event)
+
+    def selectPolicy(self):
+        if self.agent_type==0:
+            return 0
+        i = np.random.randint(0, self.nb_subPolicies, 1)[0]
+        self.currentPolicy = i
+
+    def eval(self):
+        if self.q is not None:
+            for p in self.policies:
+                p.eval()
+            self.q.eval()
+
+    def train(self):
+        if self.q is not None:
+            for p in self.policies:
+                p.train()
+            self.q.train()
+
+    def soft_update(self):
+        if self.q is not None:
+            for i in range(len(self.policies)):
+                for target, src in zip(self.targetPolicies[i].parameters(), self.policies[i].parameters()):
+                    target.data.copy_(target.data * self.polyakP + src.data * (1-self.polyakP))
+            for target, src in zip(self.qtarget.parameters(), self.q.parameters()):
+                target.data.copy_(target.data * self.polyakQ + src.data * (1 - self.polyakQ))
+
+    def setcuda(self,device):
+        Agent.floatTensor = torch.cuda.FloatTensor(1, device=device)
+        Agent.longTensor = torch.cuda.LongTensor(1, device=device)
+        if self.q is not None:
+            for p in self.policies:
+                p.setcuda(device)
+            for p in self.targetPolicies:
+                p.setcuda(device)
+            self.q.setcuda(device)
+            self.qtarget.setcuda(device)
+
+    def save(self,file):
+        if self.q is not None:
+            for x in range(self.nb_subPolicies):
+                torch.save(self.policies[x].state_dict(), file + "_policy_" + str(self.id) + "_" + str(x) + ".txt")
+            torch.save(self.q.state_dict(), file + "_value_"+str(self.id)+".txt")
+
+    def load(self,file):
+        if self.q is not None:
+            for x in range(self.nb_subPolicies):
+                self.policies[x].load_state_dict(torch.load(file +"_policy_"+str(self.id)+"_"+str(x)+".txt"))
+                self.q.load_state_dict(torch.load(file + "_value_"+str(self.id)+".txt"))
+
+    def sample(self):
+        batch = random.sample(self.events[0], self.batchsize)
+        obs, actions, rewards, new_obs, ds = \
+            [torch.stack([torch.tensor(minibatch[0][i], dtype=torch.float) for minibatch in batch]) for i in range(self.env.n)], \
+            [torch.tensor([minibatch[1][i] for minibatch in batch], dtype=torch.float) for i in range(self.env.n)], \
+            [torch.tensor([minibatch[2][i] for minibatch in batch], dtype=torch.float) for i in range(self.env.n)], \
+            [torch.stack([torch.tensor(minibatch[3][i], dtype=torch.float) for minibatch in batch]) for i in range(self.env.n)], \
+            [torch.tensor([minibatch[4] for minibatch in batch], dtype=torch.float) for i in range(self.env.n)]
+        return obs, actions, rewards, new_obs, ds
+
+
+
+class MADDPG(object):
+    floatTensor = torch.FloatTensor(1)
+    longTensor = torch.LongTensor(1)
+    verbose = 0
+
+    def __init__(self, env, opt, action_size, obs_shapes, noise, noiseTest):
+        super(MADDPG, self).__init__()
+        self.action_size = action_size
+        self.env = env
+        self.opt = opt
+        self.gamma = self.opt.gamma
+
+        agent_types = self.opt.agent_types
+        nb_subPolicies =  self.opt.nb_subPolicies
+        lr = self.opt.lr
+        lrq = self.opt.lrq
+        device = self.opt.device
+
+        nbSteps = self.opt.nbSteps
+        freqOptim = self.opt.freqOptim
+        optimizer = torch.optim.Adam
+        seed = self.opt.seed
+
+        self.freqOptim = freqOptim
+        self.nbSteps = nbSteps
+        self.noise = noise
+        self.noiseTest = noiseTest
+        self.startEvents = self.opt.startEvents
+        self.test=False
+
+        self.nbEvts = 0
+        self.nbEvents = 0
+
+        self.polyakP = self.opt.polyakP
+        self.polyakQ = self.opt.polyakQ
+        self.nbOptim = 0
+
+        self.nbRuns = 0
+
+        self.agents = []
+        for i in range(env.n):
+            a = Agent(env,opt,i,action_size,obs_shapes,agent_types[i],nb_subPolicies[i],optimizer,lr=lr[i],lrq=lrq[i], hidden_size_mu=opt.layers, hidden_size_q=opt.layers)
+            self.agents.append(a)
+
+        self.nb=0
+
+        self.sumDiff=0
+        prs("lr", lr)
+
+        self.current=[]
+        self.batchsize = self.opt.batchsize
+
+        if self.opt.fromFile is not None:
+            self.load(self.opt.fromFile)
+
+        if device>=0:
+            cudnn.benchmark = True
+            torch.cuda.device(device)
+            torch.cuda.manual_seed(seed)
+            MADDPG.floatTensor = torch.cuda.FloatTensor(1, device=device)
+            MADDPG.longTensor = torch.cuda.LongTensor(1, device=device)
+            for i in range(env.n):
+                self.agents[i].setcuda(device)
+
+
+    def save(self, file):
+        for agent in self.agents:
+            agent.save(file)
+
+    def load(self,file):
+        for agent in self.agents:
+            agent.load(file)
+
+    def store(self,ob,action,new_ob,rewards,done,it):
+        d=done[0]
+        if it == self.opt.maxLengthTrain:
+            print("undone")
+            d = False
+
+        for a in self.agents:
+            #print(("ob", ob, "a", action, "r", rewards, "new_ob", new_ob, d))
+            a.addEvent((ob, action, rewards, new_ob, d))
+        self.nbEvts += 1
+
+    def act(self, obs):
+        for a in self.agents:
+            a.eval()
+        if self.nbEvts > self.startEvents:
+            with torch.no_grad():
+                actions = torch.cat([self.agents[i].act(self.floatTensor.new(obs[i])).view(-1) for i in range(self.env.n)],dim=-1).cpu()
+                if (not self.test) or self.opt.sigma_noiseTest>0:
+                    noise = self.noise
+                    if self.test:
+                        noise=self.noiseTest
+                    e=torch.cat([x.sample() for x in noise],dim=-1)
+                    actions=actions+e.view(-1)
+                actions=actions.numpy()
+        else:
+            actions =np.concatenate([x.sample().numpy() for x in self.noise],axis=-1)
+        return actions.reshape((self.env.n, -1))
+
+    def endsEpisode(self):
+        for i in range(self.env.n):
+            self.noise[i].reset()
+            self.noiseTest[i].reset()
+            self.agents[i].selectPolicy()
+
+    # retoune vrai si c'est le moment d'entraîner l'agent.
+    # Dans cette version retourne vrai tous les freqoptim evenements
+    def timeToLearn(self, done):
+        if self.test:
+            return False
+        self.nbEvents += 1
+        #print(self.nbEvents,self.opt.freqOptim,self.opt.startEvents)
+        if self.nbEvents % self.opt.freqOptim == 0 and  self.nbEvents > self.opt.startEvents:
+            print("Time to Learn! ")
+            return True
+        return False
+
+    def learn(self):
+        self.nbOptim += 1
+        for a in self.agents:
+            a.train()
+        sl = torch.nn.SmoothL1Loss()
+
+        for j in range(self.nbSteps):
+            for x in range(self.env.n):
+                agent = self.agents[x]
+                if agent.agent_type==0:
+                    continue
+                #TODO learn agent
+                else:
+                    if len(agent.events[0]) > self.batchsize:
+                        obs, actions, rewards, new_obs, ds = agent.sample()
+                        
+                        #critic
+                        with torch.no_grad():
+                            targetActions = [agent.targetPolicies[0](new_obs[i]) for i in range(self.env.n)]
+                            y = rewards[x].unsqueeze(-1) + self.gamma * agent.qtarget(new_obs, targetActions)
+                        loss_critic = sl(agent.q(obs, actions), y.detach())
+                        agent.optimizerQ.zero_grad()
+                        loss_critic.backward()
+                        agent.optimizerQ.step()
+
+                        #actor
+                        behaviorActions = [agent.policies[0](obs[i]) for i in range(self.env.n)]
+                        loss_actor = - agent.q(obs, behaviorActions).mean()
+                        agent.optimizerP[0].zero_grad()
+                        loss_actor.backward()
+                        agent.optimizerP[0].step()
+
+        for x in range(self.env.n):
+            self.agents[x].soft_update()
+
+
+
+
+
+
+"""
+Code for creating a multiagent environment with one of the scenarios listed
+in ./scenarios/.
+Can be called by using, for example:
+    env = make_env('simple_speaker_listener')
+After producing the env object, can be used similarly to an OpenAI gym
+environment.
+
+A policy using this environment must output actions in the form of a list
+for all agents. Each element of the list should be a numpy array,
+of size (env.world.dim_p + env.world.dim_c, 1). Physical actions precede
+communication actions in this array. See environment.py for more details.
+"""
+
+def make_env(scenario_name, benchmark=False):
+    '''
+    Creates a MultiAgentEnv object as env. This can be used similar to a gym
+    environment by calling env.reset() and env.step().
+    Use env.render() to view the environment on the screen.
+
+    Input:
+        scenario_name   :   name of the scenario from ./scenarios/ to be Returns
+                            (without the .py extension)
+        benchmark       :   whether you want to produce benchmarking data
+                            (usually only done during evaluation)
+
+    Some useful env properties (see environment.py):
+        .observation_space  :   Returns the observation space for each agent
+        .action_space       :   Returns the action space for each agent
+        .n                  :   Returns the number of Agents
+    '''
+    from multiagent.environment import MultiAgentEnv
+    import multiagent.scenarios as scenarios
+
+    # load scenario from script
+    scenario = scenarios.load(scenario_name + ".py").Scenario()
+    # create world
+    world = scenario.make_world()
+    # create multiagent environment
+    world.dim_c = 0
+    if benchmark:
+        env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation, scenario.benchmark_data)
+    else:
+        env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation)
+    env.discrete_action_space = False
+    env.discrete_action_input = False
+    scenario.reset_world(world)
+    print("env ok!")
+    return env #,scenario,world
+
+def padObs(obs,size):
+    return([np.concatenate((o,np.zeros(size-o.shape[0]))) if o.shape[0]<size else o for o in obs])
+
+if __name__ == '__main__':
+
+    env, config, outdir, logger = init('./configs/config_maddpg_simple_spread.yaml', "MADDPG")
+
+    freqTest = config["freqTest"]
+    freqSave = config["freqSave"]
+    nbTest = config["nbTest"]
+    env.seed(config["seed"])
+    np.random.seed(config["seed"])
+    episode_count = config["nbEpisodes"]
+
+
+    noise = [config["noise"](config["action_size"], sigma=config["sigma_noise"]) for i in range(env.n)]
+    noiseTest = [config["noise"](config["action_size"], sigma=config["sigma_noiseTest"]) for i in range(env.n)]
+    #
+    #
+    obs = env.reset()
+    obs_n = [o.shape[0] for o in obs]
+    mshape=max(obs_n)
+    obs_n = [mshape for o in obs]
+
+    agent = MADDPG(env, config, config["action_size"], obs_n, noise, noiseTest)
+
+    verbose=True
+    rsum = np.zeros(env.n)
+    mean = np.zeros(env.n)
+    itest = 0
+    ntest = 0
+    ntrain = 0
+    rewards = np.zeros(env.n)
+    done = [False]
+    ended=False
+    agent.nbEvents = 0
+    for i in range(episode_count):
+        checkConfUpdate(outdir, config)
+
+        rsum = np.zeros(env.n)
+
+        obs = env.reset()
+        obs = padObs(obs, mshape)
+        # On souhaite afficher l'environnement (attention à ne pas trop afficher car ça ralentit beaucoup)
+        if i % int(config["freqVerbose"]) == 0:
+            verbose = True
+        else:
+            verbose = False
+
+        # C'est le moment de tester l'agent
+        if i % freqTest == 0 and i >= freqTest:  ##### Same as train for now
+            print("Test time! ")
+            mean = np.zeros(env.n)
+            agent.test = True
+
+        # On a fini cette session de test
+        if i % freqTest == nbTest and i > freqTest:
+            print("End of test, mean reward=", mean / nbTest)
+            itest += 1
+            #logger.direct_write("rewardTest", mean / nbTest, itest)
+            for k in range(env.n):
+                logger.direct_write("rewardTest/raw_" + str(k), mean[k]/nbTest, itest)
+            agent.test = False
+
+        # C'est le moment de sauver le modèle
+        if i % freqSave == 0:
+            agent.save(outdir + "/save_" + str(i))
+
+        j = 0
+        if verbose:
+            env.render()
+
+
+        new_obs = np.array(obs)
+
+        ended = False
+
+        while True:
+
+            if verbose:
+                env.render(mode="none")
+
+            obs = new_obs
+            actions = agent.act(obs)
+
+            j += 1
+            new_obs, rewards, done, _ = env.step(actions)
+            new_obs = padObs(new_obs, mshape)
+            if ((not agent.test) and j >= int(config["maxLengthTrain"])) or (j>=int(config["maxLengthTest"])) :
+                ended=True
+            new_obs = np.array(new_obs)
+            rewards = np.array(rewards)
+            if (not agent.test):
+
+                agent.store(obs, actions, new_obs, rewards, done,j)
+
+                if agent.timeToLearn(ended):
+                    agent.learn()
+
+            rsum += rewards
+
+            if done[0] or ended:
+                agent.endsEpisode()
+                if not agent.test:
+                    ntrain += 1
+                    print("Train:",str(ntrain) + " rsum=" + str(rsum) + ", " + str(j) + " actions ")
+                    for k in range(len(rsum)):
+                        logger.direct_write("reward/raw_"+str(k), rsum[k], ntrain)
+                else:
+                    ntest += 1
+                    print("Test:", str(ntest) + " rsum=" + str(rsum) + ", " + str(j) + " actions ")
+
+
+                mean = mean + rsum
+                rsum = np.zeros(env.n)
+
+                break
+
+
+    env.close()
+

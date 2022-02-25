@@ -1,0 +1,23 @@
+env: LunarLander-v2  # environnement
+seed: 5
+featExtractor: !!python/name:__main__.NothingToDo ''
+freqSave: 1000
+freqTest: 200
+nbTest: 100
+freqVerbose: 100
+freqOptim: 300                                                                         # Optimisation de la politique tous les freqOptim evenements
+fromFile: null
+nbEpisodes: 1000000
+maxLengthTrain: 300
+maxLengthTest: 500
+gamma: 0.99
+epochs: 10
+batch_size: 16
+tau: 0.95
+clip: 0.2
+explo: 0.1
+c1: 0.5
+c2: 0.001
+decay: 0.99999
+lr: 0.0001
+expert_data_path: './expert.pkl'

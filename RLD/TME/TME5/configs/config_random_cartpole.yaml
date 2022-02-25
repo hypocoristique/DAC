@@ -1,0 +1,19 @@
+env: CartPole-v1                                                  # environnement
+seed: 5
+featExtractor: !!python/name:__main__.NothingToDo ''
+freqSave: 1000
+freqTest: 100
+nbTest: 1
+freqVerbose: 100
+freqOptim: 1000         # Optimisation de la politique tous les freqOptim evenements
+fromFile: null
+nbEpisodes: 10000
+maxLengthTrain: 500
+maxLengthTest: 500
+gamma: 0.99
+lr: 0.0005
+tau: 0.99
+mode: 'TD(lambda)' # among 'TD(0)', 'MC', 'TD(lambda)'  lambda parameter is the same as the gae, i.e tau.
+# for Experience Replay TODO for now prior not working
+#freqTarget: 100
+#https://www.youtube.com/watch?v=OxV2eUqCmzw&ab_channel=ProgrammingDatascienceandOthers
